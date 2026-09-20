@@ -1,0 +1,10 @@
+run: "docker compose up -d && uvicorn src.main:app --reload --port 8000"
+seed: "python -c \"from src.db import init_db; init_db()\""
+test: "python tests/test_cost.py"
+base_url: "http://localhost:8000"
+endpoints:
+  - "GET /health"
+  - "POST /generate"
+  - "GET /usage/{tenant_id}"
+  - "POST /checkout"
+  - "POST /webhooks/stripe"

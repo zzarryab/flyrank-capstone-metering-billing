@@ -84,6 +84,14 @@ def usage(tenant_id: str):
     api_calls_used = get_monthly_usage(tenant_id, "api_call")
     tokens_used = get_monthly_usage(tenant_id, "ai_tokens")
 
+    # For this rollup, treat all counted tokens as simple "input" for a basic total.
+    # A fuller implementation would track input/cached/output/reasoning separately
+    # per event in `metadata` and sum them precisely — see EVIDENCE.md for a worked example.
+    from src.services.cost import calculate_token_cost_cents
+    token_cost_cents = calculate_token_cost_cents(
+        input_tokens=tokens_used, cached_input_tokens=0, output_tokens=0, reasoning_tokens=0
+    )
+
     return {
         "tenant_id": tenant_id,
         "plan": tenant["plan"],
@@ -95,6 +103,7 @@ def usage(tenant_id: str):
             "used": tokens_used,
             "limit": plan_config["ai_tokens_limit"],
         },
+        "estimated_cost_cents": token_cost_cents,
     }
 
 
