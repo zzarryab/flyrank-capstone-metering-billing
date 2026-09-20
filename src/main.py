@@ -1,3 +1,5 @@
+import os
+import stripe
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -11,6 +13,9 @@ from src.plans import PLANS
 app = FastAPI()
 init_db()
 
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRO_PRICE_ID = os.getenv("STRIPE_PRO_PRICE_ID", "price_your_id_here")
+
 
 class GenerateRequest(BaseModel):
     tenant_id: str
@@ -18,6 +23,10 @@ class GenerateRequest(BaseModel):
     quantity: int
     idempotency_key: str
     metadata: Optional[dict] = None
+
+
+class CheckoutRequest(BaseModel):
+    tenant_id: str
 
 
 @app.exception_handler(HTTPException)
@@ -87,3 +96,72 @@ def usage(tenant_id: str):
             "limit": plan_config["ai_tokens_limit"],
         },
     }
+
+
+@app.post("/checkout")
+def create_checkout(body: CheckoutRequest):
+    tenant = get_tenant(body.tenant_id)
+
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": STRIPE_PRO_PRICE_ID, "quantity": 1}],
+        success_url="http://localhost:8000/success?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="http://localhost:8000/cancel",
+        client_reference_id=body.tenant_id,
+        metadata={"tenant_id": body.tenant_id},
+    )
+    return {"checkout_url": session.url}
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    # Deduplicate: has this exact event already been processed?
+    conn = get_connection()
+    existing = conn.execute(
+        "SELECT 1 FROM processed_webhook_events WHERE stripe_event_id = %s",
+        (event["id"],),
+    ).fetchone()
+    if existing:
+        conn.close()
+        return {"status": "already processed"}
+
+    event_type = event["type"]
+    data = event["data"]["object"].to_dict()
+
+    if event_type == "checkout.session.completed":
+        tenant_id = data.get("client_reference_id") or data.get("metadata", {}).get("tenant_id")
+        if tenant_id:
+            conn.execute(
+                "UPDATE tenants SET plan = 'pro', stripe_customer_id = %s, stripe_subscription_id = %s, subscription_status = 'active' WHERE id = %s",
+                (data["customer"], data["subscription"], tenant_id),
+            )
+
+    elif event_type == "customer.subscription.updated":
+        conn.execute(
+            "UPDATE tenants SET subscription_status = %s WHERE stripe_subscription_id = %s",
+            (data["status"], data["id"]),
+        )
+
+    elif event_type == "customer.subscription.deleted":
+        conn.execute(
+            "UPDATE tenants SET plan = 'free', subscription_status = 'canceled' WHERE stripe_subscription_id = %s",
+            (data["id"],),
+        )
+
+    conn.execute(
+        "INSERT INTO processed_webhook_events (stripe_event_id) VALUES (%s)",
+        (event["id"],),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"status": "processed"}
